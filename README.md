@@ -1,18 +1,22 @@
 # Presidency University Campus Guide
 
-Streamlit campus navigation prototype with Gemini-powered natural-language intent parsing and photo-based location identification.
+Streamlit campus navigation assistant with Gemini photo identification, a Plotly campus map, NetworkX shortest-path routing, and a RAG knowledge search pipeline.
 
-## Deploy on Streamlit Community Cloud
-1. Upload the contents of this folder to a GitHub repository.
-2. In Streamlit Community Cloud, create an app from that repository and select `app.py` as the main file.
-3. In the app's Settings → Secrets, add:
+## RAG pipeline
 
-```toml
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_VISION_MODEL = "gemini-3.8-flash"
+1. Campus directory facts are split into overlapping word chunks.
+2. `sentence-transformers/all-MiniLM-L6-v2` creates normalized embeddings.
+3. ChromaDB stores the embeddings in an in-memory collection.
+4. A query embedding retrieves the configured Top-K most similar chunks.
+5. Gemini can phrase an answer using retrieved context; NetworkX remains responsible for route calculation.
+
+The initial knowledge base is generated from the campus locations and draft route graph already in the application. It is a starter directory, not an official campus handbook. Office hours, exact positions, and walking connections are not independently verified.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
-4. Save and redeploy. Never commit your API key to GitHub.
-
-The `campus_reference_pages` folder must remain beside `app.py`.
+Set `GEMINI_API_KEY` as an environment variable or in Streamlit Community Cloud Secrets. Never commit API keys.

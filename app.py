@@ -14,6 +14,16 @@ try:
 except Exception:
     GEMINI_AVAILABLE = False
 
+# RAG stack: ChromaDB stores vectors; Sentence Transformers creates embeddings.
+try:
+    import chromadb
+    from sentence_transformers import SentenceTransformer
+    RAG_AVAILABLE = True
+except Exception:
+    chromadb = None
+    SentenceTransformer = None
+    RAG_AVAILABLE = False
+
 st.set_page_config(
     page_title="Presidency Campus Guide",
     page_icon="🧭",
@@ -266,6 +276,139 @@ Rules:
     except Exception:
         return None
 
+# ------------------------- RAG / CHROMADB -------------------------
+# The starter knowledge base is generated only from the campus directory and
+# draft route graph already present in this project. It does not invent hours,
+# building descriptions, distances, or verified walking instructions.
+RAG_CHUNK_SIZE_DEFAULT = 450
+RAG_CHUNK_OVERLAP_DEFAULT = 80
+RAG_TOP_K_DEFAULT = 3
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+def build_campus_documents():
+    docs = [
+        {"id": "overview", "text": "Presidency University campus guide for the Yelahanka campus in Bengaluru. This knowledge base is a starter directory generated from the locations and draft route graph in this application. The map coordinates and connections are approximate and require on-campus verification."},
+    ]
+    for name, (x, y, category) in LOCATIONS.items():
+        docs.append({
+            "id": "location_" + re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_"),
+            "text": f"{name} is listed in the Presidency University campus directory. Category: {category}. It appears on the application's schematic campus map. The map position is approximate and should be verified on campus.",
+        })
+    categories = {}
+    for name, (_, _, category) in LOCATIONS.items():
+        categories.setdefault(category, []).append(name)
+    for category, names in categories.items():
+        docs.append({
+            "id": "category_" + re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_"),
+            "text": f"Campus locations categorized as {category}: " + ", ".join(names) + ". This is the application's draft directory; confirm current availability and exact locations with campus signage.",
+        })
+    # Include only connections explicitly present in the current draft graph.
+    for a, b in EDGES:
+        docs.append({
+            "id": "connection_" + re.sub(r"[^a-z0-9]+", "_", a.lower()) + "_" + re.sub(r"[^a-z0-9]+", "_", b.lower()),
+            "text": f"The current draft campus route graph contains a connection between {a} and {b}. This edge is an unverified prototype connection, not a surveyed pedestrian path.",
+        })
+    return docs
+
+def split_text_into_chunks(text, chunk_size=RAG_CHUNK_SIZE_DEFAULT, overlap=RAG_CHUNK_OVERLAP_DEFAULT):
+    """Split text into overlapping word chunks for embedding and retrieval."""
+    words = text.split()
+    if not words:
+        return []
+    chunk_size = max(50, int(chunk_size))
+    overlap = max(0, min(int(overlap), chunk_size // 2))
+    chunks, start = [], 0
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start = end - overlap
+    return chunks
+
+@st.cache_resource(show_spinner="Loading embedding model and building the ChromaDB campus index...")
+def load_rag_index(chunk_size=RAG_CHUNK_SIZE_DEFAULT, chunk_overlap=RAG_CHUNK_OVERLAP_DEFAULT):
+    """Create an in-memory ChromaDB collection populated with sentence embeddings."""
+    if not RAG_AVAILABLE:
+        raise RuntimeError("RAG dependencies are unavailable. Install chromadb and sentence-transformers.")
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    client = chromadb.Client()
+    collection = client.create_collection(
+        name="presidency_campus_" + str(chunk_size) + "_" + str(chunk_overlap),
+        metadata={"hnsw:space": "cosine"},
+    )
+    chunk_ids, chunk_texts, metadatas = [], [], []
+    for doc in build_campus_documents():
+        for index, chunk in enumerate(split_text_into_chunks(doc["text"], chunk_size, chunk_overlap)):
+            chunk_ids.append(f"{doc['id']}_chunk_{index}")
+            chunk_texts.append(chunk)
+            metadatas.append({"source": doc["id"], "chunk": index})
+    if chunk_texts:
+        vectors = model.encode(chunk_texts, normalize_embeddings=True, show_progress_bar=False).tolist()
+        # Chroma has a per-batch limit in some hosted environments. Add safe batches.
+        for start in range(0, len(chunk_texts), 400):
+            stop = start + 400
+            collection.add(
+                ids=chunk_ids[start:stop],
+                documents=chunk_texts[start:stop],
+                embeddings=vectors[start:stop],
+                metadatas=metadatas[start:stop],
+            )
+    return model, collection
+
+def retrieve_campus_context(question, top_k=RAG_TOP_K_DEFAULT, chunk_size=RAG_CHUNK_SIZE_DEFAULT, chunk_overlap=RAG_CHUNK_OVERLAP_DEFAULT):
+    """Embed a query and retrieve its Top-K nearest campus knowledge chunks."""
+    if not RAG_AVAILABLE:
+        return [], "RAG dependencies are not installed."
+    try:
+        model, collection = load_rag_index(int(chunk_size), int(chunk_overlap))
+        if collection.count() == 0:
+            return [], "The campus knowledge index is empty."
+        query_vector = model.encode([question], normalize_embeddings=True).tolist()
+        result = collection.query(
+            query_embeddings=query_vector,
+            n_results=min(max(1, int(top_k)), collection.count()),
+            include=["documents", "distances", "metadatas"],
+        )
+        docs = result.get("documents", [[]])[0]
+        distances = result.get("distances", [[]])[0]
+        metas = result.get("metadatas", [[]])[0]
+        retrieved = [
+            {"text": text, "distance": float(distance), "source": meta.get("source", "campus_directory"), "chunk": meta.get("chunk", 0)}
+            for text, distance, meta in zip(docs, distances, metas)
+        ]
+        return retrieved, None
+    except Exception as exc:
+        return [], f"RAG retrieval error: {exc}"
+
+def generate_grounded_answer(question, context, route_description, api_key):
+    """Ask Gemini to answer from retrieved campus context without inventing facts."""
+    if not (GEMINI_AVAILABLE and api_key):
+        return None
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"""You are the Presidency University Campus Guide. Answer the student's question using only the retrieved campus context and route data below. If the answer is not supported, say the information is not available in the current campus knowledge base. Do not invent office hours, distances, landmarks, building details, or verified paths. Keep the answer concise.
+
+Student question:
+{question}
+
+Retrieved campus context:
+{context}
+
+Route calculated by the local NetworkX graph (if any):
+{route_description}
+
+The route graph is an approximate prototype and must be verified on campus.
+"""
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            contents=prompt,
+        )
+        return response.text
+    except Exception:
+        return None
+
+
 def identify_campus_photo(uploaded_file, api_key):
     """Identify a campus place by comparing the uploaded photo with labelled reference pages."""
     if not (GEMINI_AVAILABLE and api_key):
@@ -508,6 +651,12 @@ with st.sidebar:
             st.session_state.active_route = shortest_route(st.session_state.start, dest)
             st.rerun()
     st.markdown("---")
+    st.markdown("**RAG knowledge search**")
+    rag_top_k = st.slider("Top-K retrieved chunks", min_value=1, max_value=8, value=RAG_TOP_K_DEFAULT, key="rag_top_k")
+    rag_chunk_size = st.slider("Chunk size (words)", min_value=100, max_value=800, value=RAG_CHUNK_SIZE_DEFAULT, step=50, key="rag_chunk_size")
+    rag_chunk_overlap = st.slider("Chunk overlap (words)", min_value=0, max_value=200, value=RAG_CHUNK_OVERLAP_DEFAULT, step=10, key="rag_chunk_overlap")
+    st.caption("RAG: " + ("ChromaDB + sentence embeddings available" if RAG_AVAILABLE else "Install chromadb and sentence-transformers"))
+    st.markdown("---")
     st.caption("Map geometry and paths are approximate and need campus verification.")
 
 map_col, chat_col = st.columns([1.15, 1], gap="large")
@@ -547,6 +696,7 @@ with chat_col:
         st.caption("✨ Natural-language AI enabled")
     else:
         st.caption("⚡ Smart local mode enabled · add a Gemini API key for more flexible questions")
+    st.caption("📚 RAG retrieval: " + ("enabled" if RAG_AVAILABLE else "dependencies missing"))
 
     # Photo-based location identification, using the user's labelled campus reference PDF.
     with st.expander("📷 Identify location from a photo", expanded=False):
@@ -632,6 +782,15 @@ with chat_col:
         chosen_dest = parsed.get("destination")
         answer = ""
 
+        # Retrieve relevant campus chunks for every question using embeddings + ChromaDB.
+        with st.spinner("Searching the campus knowledge base..."):
+            retrieved_docs, rag_error = retrieve_campus_context(
+                question, top_k=rag_top_k, chunk_size=rag_chunk_size, chunk_overlap=rag_chunk_overlap
+            )
+        rag_context = "\n\n".join(
+            f"[{item['source']} | chunk {item['chunk']}] {item['text']}" for item in retrieved_docs
+        )
+
         if intent == "food":
             options = parsed.get("suggestions") or [
                 name for name, (_, _, cat) in LOCATIONS.items() if cat == "Food"
@@ -665,6 +824,26 @@ with chat_col:
             answer += "Try **'How do I get from U-Block to H-Block?'**, **'Where is the admission office?'**, or **'Where can I get coffee?'**"
         else:
             answer = "I can help with campus navigation. Please mention a place name, such as **cafeteria**, **H-Block**, **admission office**, **Subway**, or ask **'from U-Block to H-Block'**."
+        # Gemini may phrase an answer, but it receives only retrieved context and
+        # the route already calculated by NetworkX; it never creates the route.
+        route_for_prompt = st.session_state.active_route
+        route_description = "No route calculated."
+        if route_for_prompt:
+            route_description = " -> ".join(route_for_prompt)
+        if rag_context and api_key:
+            grounded = generate_grounded_answer(question, rag_context, route_description, api_key)
+            if grounded:
+                if intent in ("route", "find_place") and chosen_dest:
+                    answer = grounded + "\n\n---\n**Route calculated by the campus graph:**\n\n" + route_text(route_for_prompt)
+                else:
+                    answer = grounded
+        if retrieved_docs:
+            answer += "\n\n**Retrieved campus sources:** " + ", ".join(
+                f"`{item['source']}`" for item in retrieved_docs
+            )
+        elif rag_error:
+            answer += f"\n\n*Knowledge retrieval unavailable: {rag_error}*"
+
         assistant_message = {"role": "assistant", "content": answer}
         # Attach the calculated route to the response so the map appears with the text.
         if intent in ("route", "find_place") and chosen_dest and st.session_state.active_route:
@@ -696,6 +875,9 @@ with st.expander("About this prototype and its accuracy"):
         "data near the top of this Python file."
     )
     st.write(
-        "Optional AI: set GEMINI_API_KEY and install google-genai. Gemini handles text intent parsing and "
-        "photo-based location matching against the labelled campus reference pages; NetworkX calculates routes."
+        "RAG: campus directory facts are split into overlapping chunks, embedded with "
+        "sentence-transformers/all-MiniLM-L6-v2, stored in ChromaDB, and retrieved with Top-K similarity search. "
+        "The initial knowledge base is generated from the locations and draft graph in this app; it does not "
+        "contain official office hours or independently verified campus facts. Gemini can phrase answers from "
+        "retrieved context; photo identification compares uploads with the labelled reference pages; NetworkX calculates routes."
     )
